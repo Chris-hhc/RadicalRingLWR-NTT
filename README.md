@@ -142,3 +142,51 @@ All figures are **cycles per iteration** of **`memcpy`-style copy + NTT/INTT`**,
 ## Licence / upstream
 
 Source files in subprojects retain their original headers and licences where present (e.g. NXP Apache-2.0 boilerplate in some components). See each subtree for details.
+
+---
+
+## DilithiumRef — Dilithium NTT / INTT reference split
+
+`DilithiumRef/` is a small extraction of the Dilithium forward NTT and inverse NTT paths. It compares the AVX2 assembly implementation against the C reference implementation with the same measurement method used above: correctness first, then **1000** warm-up iterations and **100000** timed `copy + transform` samples measured with `rdtsc`.
+
+- **Ring length** `N` = **256** → **8** radix-2 layers.
+- **NTT modulus** `Q` = **8380417** (`0x7fe001`).
+- **Forward reference:** `ref/ntt.c::ntt`.
+- **Forward AVX2:** `avx2/ntt.S::ntt_avx`.
+- **Inverse reference:** `ref/ntt.c::invntt_tomont`.
+- **Inverse AVX2:** `avx2/invntt.S::invntt_avx`.
+
+Layer merge strategy:
+
+- **Forward `ntt_avx`:** uses a **2 + 6** split. `levels0t1` merges the first two NTT layers and is invoked for four offsets; `levels2t7` then merges layers 2 through 7, using AVX2 shuffle steps (`shuffle8`, `shuffle4`, `shuffle2`) to keep the butterfly layout vectorized. The AVX output is checked against the C reference after `nttunpack_avx` layout normalization.
+- **Inverse `invntt_avx`:** uses a **6 + 2** split. `levels0t5` merges inverse layers 0 through 5 for four offsets; `levels6t7` merges the final two inverse layers and includes the final Montgomery scaling by `mont^2 / 256` (`DIV = 41978`). Correctness prepares matching inputs by running `ntt` for the C path and `ntt_avx` for the AVX path, then compares `invntt_tomont` with `invntt_avx` modulo `Q`.
+
+Build and run from the `DilithiumRef` directory:
+
+```bash
+cd DilithiumRef
+make
+make run
+```
+
+For a clean rebuild:
+
+```bash
+make clean && make && make run
+```
+
+Representative data below was measured by running `make` and then `make run` in `DilithiumRef/` on the same host described above.
+
+### Dilithium forward NTT (`bench_ntt`)
+
+- Correctness: OK, **10000** random cases (`ntt_avx` matches after layout normalization).
+- `ntt_avx`: median **619** cycles, average **976** cycles.
+- `ntt` C reference: median **3877** cycles, average **5156** cycles.
+- Speedup: **6.2633x** by median, **5.2828x** by average.
+
+### Dilithium inverse NTT (`bench_intt`)
+
+- Correctness: OK, **10000** random cases (`invntt_avx` vs `invntt_tomont`).
+- `invntt_avx`: median **582** cycles, average **943** cycles.
+- `invntt_tomont` C reference: median **4801** cycles, average **6423** cycles.
+- Speedup: **8.2491x** by median, **6.8112x** by average.
