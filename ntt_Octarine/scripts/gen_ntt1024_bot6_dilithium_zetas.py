@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import ctypes
+import pathlib
+import re
+import sys
+
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from trace_bottom6_dilithium_layout import trace  # noqa: E402
+
+
+BLOCKS = 16
+BLOCK_STRIDE = 80
+
+
+def parse_array(text: str, name: str) -> list[int]:
+    pattern = rf"#define\s+{re.escape(name)}\s*\{{(.*?)\}}"
+    match = re.search(pattern, text, re.S)
+    if not match:
+        raise SystemExit(f"could not find {name}; pass the header containing this macro via --input")
+    return [int(tok, 0) for tok in re.findall(r"[-+]?(?:0x[0-9a-fA-F]+|\d+)", match.group(1))]
+
+
+def parse_macro(text: str, name: str) -> int:
+    pattern = rf"#define\s+{re.escape(name)}\s*\((0x[0-9a-fA-F]+|\d+)\)"
+    match = re.search(pattern, text)
+    if not match:
+        raise SystemExit(f"could not find {name}; pass the header containing this macro via --input")
+    return int(match.group(1), 0)
+
+
+def to_i32(value: int) -> int:
+    return ctypes.c_int32(value & 0xFFFFFFFF).value
+
+
+def k_for(block: int, level: int, r: int) -> int:
+    base = {4: 16, 5: 32, 6: 64, 7: 128, 8: 256, 9: 512}[level]
+    scale = {4: 1, 5: 2, 6: 4, 7: 8, 8: 16, 9: 32}[level]
+    return base + scale * block + r
+
+
+def root_vectors_for_block(block: int) -> tuple[list[int], list[str]]:
+    records, _final = trace()
+    layout: list[int] = []
+    comments: list[str] = []
+
+    def append_vector(level: int, vector_rs: list[int], label: str) -> None:
+        if len(vector_rs) != 8:
+            raise SystemExit(f"{label}: expected 8 lanes, got {len(vector_rs)}")
+        ks = [k_for(block, level, r) for r in vector_rs]
+        layout.extend(ks)
+        comments.append(f"block {block:02d} {label}: " + ", ".join(str(k) for k in ks))
+
+    # L4: one broadcast-equivalent vector.
+    append_vector(4, list(records[0].r), "L4")
+
+    # L5, L6, L7: one vector each; all butterflies in the level reuse it.
+    append_vector(5, list(next(r for r in records if r.level == 5).r), "L5")
+    append_vector(6, list(next(r for r in records if r.level == 6).r), "L6")
+    append_vector(7, list(next(r for r in records if r.level == 7).r), "L7")
+
+    # L8: two vectors, matching the two root loads in levels2t7.
+    l8 = [r for r in records if r.level == 8]
+    append_vector(8, list(l8[0].r), "L8a")
+    append_vector(8, list(l8[2].r), "L8b")
+
+    # L9: four vectors, one per final butterfly group.
+    for idx, rec in enumerate(r for r in records if r.level == 9):
+        append_vector(9, list(rec.r), f"L9{idx}")
+
+    if len(layout) != BLOCK_STRIDE:
+        raise SystemExit(f"block {block}: expected stride {BLOCK_STRIDE}, got {len(layout)}")
+    expected = set()
+    for level, count in ((4, 1), (5, 2), (6, 4), (7, 8), (8, 16), (9, 32)):
+        expected.update(k_for(block, level, r) for r in range(count))
+    used = set(layout)
+    if used != expected:
+        raise SystemExit(f"block {block}: used k set mismatch missing={sorted(expected-used)} extra={sorted(used-expected)}")
+    return layout, comments
+
+
+def build_layout(zetas: list[int]) -> tuple[list[int], list[str]]:
+    out: list[int] = []
+    comments: list[str] = []
+    for block in range(BLOCKS):
+        ks, c = root_vectors_for_block(block)
+        out.extend(zetas[k] for k in ks)
+        comments.extend(c)
+    if len(out) != BLOCKS * BLOCK_STRIDE:
+        raise SystemExit(f"unexpected table length {len(out)}")
+    return out, comments
+
+
+def format_array(name: str, values: list[int]) -> list[str]:
+    lines = [f"static const int32_t {name}[NTT1024_BOT6_DILITHIUM_AVX2_BLOCK_STRIDE * {BLOCKS}] __attribute__((aligned(32))) = {{"]
+    for i in range(0, len(values), 8):
+        lines.append("  " + ", ".join(str(v) for v in values[i : i + 8]) + ",")
+    lines[-1] = lines[-1].rstrip(",")
+    lines.append("};")
+    return lines
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+
+    text = pathlib.Path(args.input).read_text()
+    zetas1 = parse_array(text, "RRLWR_SIGN_ZETAS1")
+    zetas2 = parse_array(text, "RRLWR_SIGN_ZETAS2")
+    prime1inv = parse_macro(text, "RRLWR_SIGN_PRIME1INV")
+    prime2inv = parse_macro(text, "RRLWR_SIGN_PRIME2INV")
+    zetas1_pre = [to_i32((z & 0xFFFFFFFF) * (prime1inv & 0xFFFFFFFF)) for z in zetas1]
+    zetas2_pre = [to_i32((z & 0xFFFFFFFF) * (prime2inv & 0xFFFFFFFF)) for z in zetas2]
+
+    table1, comments = build_layout(zetas1)
+    table1_pre, _ = build_layout(zetas1_pre)
+    table2, _ = build_layout(zetas2)
+    table2_pre, _ = build_layout(zetas2_pre)
+
+    _records, final = trace()
+    inverse = [0] * 64
+    for pos, natural in enumerate(final):
+        inverse[natural] = pos
+
+    lines: list[str] = []
+    lines.append("/* Auto-generated by scripts/gen_ntt1024_bot6_dilithium_zetas.py */")
+    lines.append("#ifndef NTT1024_BOT6_DILITHIUM_ZETAS_H")
+    lines.append("#define NTT1024_BOT6_DILITHIUM_ZETAS_H")
+    lines.append("")
+    lines.append("#include <stdint.h>")
+    lines.append("#include \"parameters.h\"")
+    lines.append("")
+    lines.append("#define NTT1024_BOT6_DILITHIUM_AVX2_BLOCK_STRIDE 80")
+    lines.append("")
+    lines.append("/* Per-block root vector source k mapping:")
+    for comment in comments[:10]:
+        lines.append(f" * {comment}")
+    lines.append(" * ... repeated for blocks 10..15")
+    lines.append(" */")
+    lines.append("")
+    lines.extend(format_array("RRLWR_SIGN_ZETAS1_BOT6_DILITHIUM_AVX2", table1))
+    lines.append("")
+    lines.extend(format_array("RRLWR_SIGN_ZETAS1_PRE_BOT6_DILITHIUM_AVX2", table1_pre))
+    lines.append("")
+    lines.extend(format_array("RRLWR_SIGN_ZETAS2_BOT6_DILITHIUM_AVX2", table2))
+    lines.append("")
+    lines.extend(format_array("RRLWR_SIGN_ZETAS2_PRE_BOT6_DILITHIUM_AVX2", table2_pre))
+    lines.append("")
+    lines.append("static const uint8_t NTT1024_BOT6_DILITHIUM_AVX2_FINAL_PERM[64] = {")
+    for i in range(0, 64, 16):
+        lines.append("  " + ", ".join(str(v) for v in final[i : i + 16]) + ",")
+    lines[-1] = lines[-1].rstrip(",")
+    lines.append("};")
+    lines.append("")
+    lines.append("static const uint8_t NTT1024_BOT6_DILITHIUM_AVX2_INVERSE_PERM[64] = {")
+    for i in range(0, 64, 16):
+        lines.append("  " + ", ".join(str(v) for v in inverse[i : i + 16]) + ",")
+    lines[-1] = lines[-1].rstrip(",")
+    lines.append("};")
+    lines.append("")
+    lines.append("#endif")
+    lines.append("")
+
+    pathlib.Path(args.output).write_text("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
